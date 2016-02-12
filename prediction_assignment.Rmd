@@ -1,0 +1,245 @@
+---
+title: "Prediction Assignment Writeup"
+author: "José A. Ariño"
+date: "Saturday, February 06, 2016"
+output: html_document
+---
+
+```{r setoptions,echo=TRUE,warning=FALSE,message=FALSE}
+# general options: working in parallel
+library(knitr);library(caret);library(ggplot2);library(tidyr);library(rattle)
+library(parallel);library(doParallel);library(gridExtra)
+cl <- makePSOCKcluster(2)
+registerDoParallel(cl)
+opts_chunk$set(echo=TRUE,warning=FALSE,message=FALSE)
+```
+
+# Introduction
+The goal of this project is to build a statistical learning algorithm to predict the manner that people do a physical activity, weight lifting specifically.  
+ 
+The 6 participants in the experiment were asked to perform barbell lifts correctly and incorrectly in 5 different ways ("classe" variable with 5 categories: A,B,C,D y E), registering in a data set, for each way, a lot of measurements obtained from some accelerometers (on the belt, forearm, arm, and dumbbell), while they were doing the exercise.
+
+The "A" category is the correct way and the rest characterize the common mistakes.The meaning of each one is:
+```{r,echo=FALSE}
+classe<-data.frame(classe=c('A','B','C','D','E'),description=c("exactly according to the specification",
+                   "throwing the elbows to the front",
+                   "lifting the dumbbell only halfway",
+                   "lowering the dumbbell only halfway",
+                   "throwing the hips to the front"))
+grid.table(classe)
+```
+
+This report will describe how has been built the prediction algorithm of the qualitative variable "classe", using a set of predictors selected between the quantitative measurements mentioned above.
+
+# Getting data
+The data are in the next direction.
+
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv  
+
+Additionally, the script will obtain another data set with 20 observations without the "classe" variable, which will be used to solve the Course Project Prediction Quiz. This is got from:  
+
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv  
+
+The whole data are obtained from the next source: http://groupware.les.inf.puc-rio.br/har,in the paragraph "Weight Lifting Exercises Dataset""
+
+The script will allow to download the csv files and read them in R, assuming we are in the work folder.  
+
+```{r}
+# 1- creating data folder
+if (!file.exists("data")) {dir.create("data")}
+# 2- downloading
+url1<-"http://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+url2<-"http://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+file1<-"./data/pml-training.csv"
+file2<-"./data/pml-testing.csv"    
+if (!file.exists(file1)){download.file(url1,file1)} # controlling if it exists.
+if (!file.exists(file2)){
+    download.file(url2,file2)
+    write.csv(date(),"./da
+              ta/date-download.txt")} # download date
+# 3- Reading
+training_r0<-read.table(file1,sep=",",header=T,colClasses="character",
+                     na.strings=c("NA",""))
+testing_r0<-read.table(file2,sep=",",header=T,colClasses="character",
+                     na.strings=c("NA",""))
+```
+
+# Cleaning data
+
+The raw data is a data set with `r dim(training_r0)[2]` variables. The process to adjust and select the relevant variables is essential for the performance of the selected algorithm. The steps developed have been the next ones. Most of them consist in removing variables that not add value as predictors. We are going to be very demanding with the variation of the predictors, given the high number of them.  
+
+1. Predictors variables that do not contain any measurement. They are the seven first columns - user_name, times, windows-, which will be removed.
+```{r}
+training_r<-training_r0[,-c(1:7)]
+dim(training_r)
+```
+
+2. Adjusting variable types. The outcome variable will be a factor, and the rest - the measurements-, numeric ones. 
+```{r results='hide'}
+# adjusting the predictor types -the first 152-: 
+predictors<-as.data.frame(apply(training_r[,1:152],2,as.numeric))
+# adjusting the outcome type -the last one-:
+classe<-as.factor(training_r[,153])
+
+# adjusting the predictor types in testing_r0
+test<-as.data.frame(apply(testing_r0[,1:160],2,as.numeric))
+```
+
+3. Predictors that have more than 50 % of NA values. 
+```{r results='hide'}
+fun<-function(x){sum(is.na(x))/nrow(predictors)}
+na<-apply(predictors,2,fun) # relative number of NA in each predictor
+out<-which(na>0.5)
+predictors<-predictors[,-out]
+dim(predictors)
+predictors_old<-predictors
+```
+In this case we find `r length(out)` predictors to remove.
+ 
+4. Predictors whose variance is very low: If a predictor has a significance low variance, it will  explain a bit of the outcome. Our threshold in this case is: coefficient of variation < 10. 
+
+```{r}
+# coefficient of variation
+sd<-apply(predictors,2,sd)
+me<-apply(predictors,2,mean)
+cvar<-sd*100/me
+# predictors with cvar<10
+out<-which(abs(cvar)<10)
+predictors<-predictors[,-out]
+```
+In this case we have removed `r length(out)` predictors.  
+
+5. Redundant predictors: We get rid of the predictors with high correlation with other ones. The selected cutoff is: correlation coefficient > 0.8. 
+```{r results= 'hide' }
+correlationMatrix <- cor(predictors)
+# finding highly correlated predictors (ideally >0.8)
+highlyCorrelated <- findCorrelation(correlationMatrix, cutoff=0.8)
+# extracting highly correlated predictors
+predictors<-predictors[,-highlyCorrelated]
+dim(predictors)
+````
+
+As result, we can remove `r length(highlyCorrelated)` predictors.
+
+```{r results= 'hide'}
+training_r<-cbind(predictors,classe)
+dim(training_r)
+save(training_r,test,file="dat")
+```
+
+At last, the data dimensions are: `r dim(training_r)[1]` rows -observations- and `r dim(training_r)[2]` columns - variables- with `r dim(predictors)[2]` predictors.
+
+Let's see a sample of the data, including the outcome variable.
+
+```{r echo=TRUE}
+dim(training_r)
+head(training_r[,35:39])
+```
+
+# A Random Forest Model
+
+We need to build a model to predict a qualitative response with 5 categories (A,B,C,D y E) and 38 numeric predictors (a "classifier"). The selected model has been Random Forest; the main reason for this selection is its good performance -bigger than 99 % in overall accuracy - . This issue compensates the low interpretability of this model, in comparison, for instance, with tree models.
+
+The model has been built applying the caret package. This allows to choose a lot of elements for building the best model. Let's see some of our choices:
+
+## Data Splitting
+The training set is the result of applying a random stratified method, with the 70 % of the whole data. The rest of the sample will form the test set.  
+
+```{r}
+# seed 
+set.seed(333)
+inTrain<-createDataPartition(y=training_r$classe,p=0.7,list=FALSE)
+training<-training_r[inTrain,]
+testing<-training_r[-inTrain,]
+dim(training)
+dim(testing)
+```
+
+## What the expected out of sample error is?
+
+In general, the expected out of sample error (OOS) is a measurement of the performance of a prediction model, particularly obtained in a set of data that was not used in the set of observations where the model was trained. It is considered the best index, because of it allows to avoid the possible overfitting over the data.  
+
+In our model, instead of the expected OOS error, we will estimate the overall accuracy, but the meaning , although reversely, is the same: In percentage terms, the OOS error is 100 - Accuracy.  
+
+Our Random Forest model is going to use the expected OOS accuracy in three different cases:  
+
+1. In the process of fitting each one of the trees of the forest: Building a random forest includes making a lot of resamples with the bootstrap method. The evaluation of the performance of each one is done with OOS accuracy.  
+
+2. In the process of selecting the appropriate level of flexibility of the model - *mtry*-. We will develop it in the next section.  
+
+3. In the evaluation of the model's performance with the testing set. This issue is described in the last two paragraphs.   
+
+## How cross-validation is used? 
+
+Random Forest requires the choice of an important parameter, *mtry*, -number of predictors to consider in each node-. Caret aids to choose the optimal *mtry* (the value that yields the biggest accuracy) applying a resampling scheme that can be tunned: "K-fold cross validation" with k = 10, has been our choose. We think that selecting 10 folds is acceptable, given the big size of the sample.
+
+Also,the number of models to evaluate with the cross-validation is 8 -bigger than the default one (3)-.This last two issues are included in the caret package with the trainControl function and with the tuneLength parameter.
+
+In the next paragraph the model will be selected applying the 10-fold cross validatin scheme.
+
+## Selecting the model  
+```{r}
+# tuning control method
+fitCtrl <- trainControl(method = "cv",number = 10) # k value 
+if (!file.exists("fitRF")) {
+fitRF<-train(classe ~ .,method="rf",data=training,prox=TRUE,
+             tuneLength=8, # number of models to evaluate.
+             trControl=fitCtrl)
+save(fitRF,file="fitRF")
+stopCluster(cl)
+}
+load("fitRF")
+```
+
+The results of the cross validation are:
+```{r}
+fitRF
+```
+
+As we can see in the grid above, there are 8 models, each one with a different *mtry*, from 2 in the first row to 38 in the last one. The results of each model come from a 10-cross-validation analysis over the training data set ( 13.737 samples ): Each model has been trained in ten different samples with about 12.363 observations (90% of 13.737) and tested in the rest (1.374). The 10 results are averaged and printed in the columns of the right.
+
+The cross-validation method described above for working out the accuracy -testing with observations that did not use in the training- shows that this index can be considered as an expected out of sample accuracy.
+
+We can see the results more clearly in the next plot, with the two first columns from the grid:  When the complexity of the model increases, the accuracy arises to a maximum (*mtry* = 7, with an accuracy of 0.9949 ). But, from this point, the accuracy decreases, because of the overfitting associated with the bigger *mtry*.
+
+```{r}
+plot.train(fitRF)
+```
+
+As the caret report says, the final model used will have a *mtry* = 7 (randomly selected predictors in each one of the nodes). It is the random forest with the largest accuracy or, in other terms, the lowest expected out of sample error.
+
+## The Final Model
+
+```{r}
+#print(fitRF$finalMode)
+impRF<-varImp(fitRF,scale=TRUE)
+plot(impRF, top = 20)
+```
+
+Because of having a large number of trees, it is not possible to plot a tree with the final model. Instead, we can see a variable importance plot. The above picture shows a list of the predictors ordered by its importance. The index of importance has been scaled to a maximum of 100. Seeing the plot, we can realize that the four most important predictors are:
+
+1. yaw_belt               
+2. magnet_dumbbell_z      
+3. pitch_forearm          
+4. magnet_dumbbell_y      
+
+## Predicting results and testing the model
+
+Finally, we are going to test the performance of our model, using the testing set. The prediction classes of this set are compared with the actual classes, yielding the accuracy of the model.
+
+```{r}
+predRF<-predict(fitRF,newdata=testing)
+confusionMatrix(predRF,testing$class)
+```
+
+As we can see in the Confusion Matrix and Statistics above, the overall accuracy is 99,49 %, that clearly confirms the high performance ot the Random Forest Model for our data set.  
+
+Furthermore, the expected out of sample error is 0.51 % (100 - Accurated). This is a valid value of the expected out of sample, because of the observations in the testing test have not been used in the set that fitted the model.
+
+## Predicting the Quiz test
+
+Additionally, there is an exercise of prediction with a blind set. It is a set with 20 cases of predictors without the classe variable.It is now easy to predict the classe. We only have to consider this test set as the newdata parameter in the predict function. Let's see:
+
+```{r}
+prRF<-predict(fitRF,newdata=test)
+prRF
